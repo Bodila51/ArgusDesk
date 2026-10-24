@@ -1,14 +1,17 @@
 ---
 name: argusdesk
-description: Pick peers from BlackRock iShares holdings, find what moves a stock (Bloomberg causal-ts), measure risk (Goldman gs-quant), backtest and paper-trade on Alpaca. Use for "what drives X" or trade ideas.
+description: Your own quant desk: iShares peers, Bloomberg causal-ts drivers, Goldman gs-quant risk, Kronos forecast, BlackRock HOLA-tuned backtest, Alpaca paper trade. Use for "what drives X".
 ---
 
-# ArgusDesk: cause, risk, backtest, paper trade
+# ArgusDesk: peers, cause, risk, forecast, backtest, paper trade
 
 One workflow built on official open-source libraries and free data:
 - **BlackRock iShares** ETF holdings (a free CSV on ishares.com) pick the stock's real peers by fund weight.
 - **Bloomberg causal-ts** (`pip install causalts`) finds who moves whom, and at what lag.
 - **Goldman Sachs gs-quant** (`pip install gs-quant`) measures risk with its `gs_quant.timeseries` math. These functions run locally and need no Goldman login.
+- **Kronos** (Tsinghua, MIT) forecasts the next 5 days of candles on CPU.
+- **BlackRock HOLA** (Apache-2.0) tunes the trading rule on training data only.
+- **Vibe-Trading** (HKU, MIT): the skill runs its three backtest checks (Bootstrap, Monte Carlo, Walk-Forward). Its optional MCP adds SEC 13F fund holdings.
 - **Alpaca** (`pip install alpaca-py`) runs the rule on a free paper-trading account. This step is optional.
 
 Work through the steps in order. Show the user a one-line status before each step. Never present results as financial advice.
@@ -19,7 +22,7 @@ Work through the steps in order. Show the user a one-line status before each ste
 pip install causalts gs-quant yfinance pandas numpy requests
 ```
 
-Check that `causal-ts --help` works. Install `alpaca-py` only if the user wants step 6.
+Check that `causal-ts --help` works. Kronos, HOLA and Vibe-Trading are installed in their own steps. Install `alpaca-py` only if the user wants step 8.
 
 ## 1. Pick the universe
 
@@ -123,18 +126,154 @@ rsi   = relative_strength_index(t, 14).iloc[-1]
 - Explain each number in one plain sentence, e.g. "volatility 48%: a normal year swings about ±48%".
 - Contrast correlation with the causal drivers from step 3. A ticker can be highly correlated and still not be a driver.
 
-## 5. Backtest one rule
+## 5. Forecast the next days (Kronos, Tsinghua)
 
-Build one simple rule from the strongest **stable lagged** edge. If there's none, say so and stop here. Don't invent a signal.
+Kronos is an open-source foundation model for candlesticks (MIT license, models on Hugging Face). The paper says it was pre-trained on "over 12 billion K-line records from 45 global exchanges". It runs on CPU. The first run downloads PyTorch and the model, so it takes a few minutes.
 
-- **Example rule:** go long the target tomorrow when the driver's return today is above +1 standard deviation, measured on the train window. Otherwise stay flat. Use the edge's lag and the edge's sign.
-- **Run it on the held-out 30% only.**
-  - Subtract 5 bp per trade.
-  - Compare with buy and hold over the same days.
-- **Report:** total return, annualized volatility, Sharpe (computed in pandas), max drawdown (use gs-quant `max_drawdown` on the equity curve), number of trades and hit rate.
+```bash
+[ -d ~/.argusdesk/Kronos ] || git clone --depth 1 https://github.com/shiyu-coder/Kronos ~/.argusdesk/Kronos
+pip install torch einops huggingface_hub safetensors tqdm
+```
+
+```python
+import os, sys, numpy as np, pandas as pd, yfinance as yf
+sys.path.insert(0, os.path.expanduser("~/.argusdesk/Kronos"))
+from model import Kronos, KronosTokenizer, KronosPredictor
+tok = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+mdl = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+kp = KronosPredictor(mdl, tok, device="cpu", max_context=512)
+
+h = yf.Ticker("NVDA").history(period="2y", auto_adjust=True)     # target candles
+h.index = h.index.tz_localize(None)
+df = h.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
+
+def kronos(x, future):
+    return kp.predict(df=x.reset_index(drop=True), x_timestamp=pd.Series(x.index),
+                      y_timestamp=pd.Series(future), pred_len=len(future),
+                      T=1.0, top_p=0.9, sample_count=5, verbose=False)
+
+x = df.iloc[-400:]
+fut = pd.bdate_range(x.index[-1] + pd.Timedelta(days=1), periods=5)
+f = kronos(x, fut)
+k_change = f["close"].iloc[-1] / x["close"].iloc[-1] - 1        # 5-day forecast, %
+
+# Honesty check: walk forward over the last 20 days, one day ahead each time
+hits = []
+for i in range(len(df) - 20, len(df)):
+    xi = df.iloc[i - 400:i]
+    p = kronos(xi, [df.index[i]])["close"].iloc[0]
+    hits.append(np.sign(p - xi["close"].iloc[-1]) == np.sign(df["close"].iloc[i] - xi["close"].iloc[-1]))
+k_hit = float(np.mean(hits))
+```
+
+- Report the 5-day forecast path and `k_change`.
+- Report `k_hit` next to 50%, which is a coin flip. If it is near 50%, say the forecast is just one more opinion.
+- The Kronos authors warn that raw forecasts are not alpha. Never present this step as a trade signal on its own.
+
+## 6. Backtest one rule (tuned by BlackRock HOLA, checked like Vibe-Trading)
+
+Build the rule only from **stable lagged** edges (lag 1 or more) from step 3. If there are none, say so and stop here. Don't invent a signal.
+
+**The rule:** go long the target when the driver's lagged move, in train-window standard deviations and in the edge's direction, is above `k`. Hold the position `hold` days. Otherwise stay flat. Each entry or exit costs 5 bp.
+
+```python
+import numpy as np, pandas as pd
+rets = pd.read_csv("qd_all.csv", index_col="date", parse_dates=True)
+split = int(len(rets) * 0.7)
+train, test = rets.iloc[:split], rets.iloc[split:]
+T = "NVDA"                                   # target
+edges = {"TSM": 1}                           # stable lagged edges from step 3: driver -> lag
+
+def stats(d):                                # train-window mean, std and edge direction
+    s = np.sign(train[d].shift(edges[d]).corr(train[T])) or 1.0
+    return train[d].mean(), train[d].std(), s
+
+def run(r, d, k, hold):
+    mu, sd, s = stats(d)
+    z = (r[d].shift(edges[d]) - mu) / sd     # driver move known before day t
+    pos = (s * z > k).astype(float).rolling(hold, min_periods=1).max()
+    cost = pos.diff().abs().fillna(pos) * 0.0005
+    return pos * r[T] - cost, pos
+
+def sharpe(x):
+    return float(x.mean() / x.std() * np.sqrt(252)) if x.std() > 0 else 0.0
+```
+
+**Tune on the train window only, with BlackRock's HOLA optimizer** (Apache-2.0, github.com/blackrock/HOLA):
+
+```bash
+pip install --pre hola-opt --extra-index-url https://blackrock.github.io/HOLA/simple/
+```
+
+```python
+from hola_opt import Study, Space, Real, Integer, Categorical, Maximize
+study = Study(space=Space(edge=Categorical(list(edges)), k=Real(0.5, 2.5), hold=Integer(1, 5)),
+              objectives=[Maximize("sharpe")], seed=42)
+
+def objective(p):
+    r, pos = run(train, p["edge"], p["k"], int(p["hold"]))
+    entries = int((pos.diff() > 0).sum())
+    return {"sharpe": sharpe(r) if entries >= 8 else -5.0}   # too few trades is not a rule
+
+study.run(objective, n_trials=80)
+best = study.top_k(1)[0].params
+```
+
+If `hola-opt` won't install, use a small grid instead: `k` from 0.5 to 2.5 in steps of 0.25, `hold` from 1 to 5, every edge. Say which one you used.
+
+**Score once on the unseen 30%.** Never re-tune after looking at these numbers.
+
+```python
+r_all, pos_all = run(rets, best["edge"], best["k"], int(best["hold"]))
+r, pos = r_all.loc[test.index], pos_all.loc[test.index]
+bh = test[T]                                  # buy and hold, same days
+```
+
+Report total return (`np.exp(r.sum()) - 1`) against buy and hold, Sharpe, max drawdown (gs-quant `max_drawdown` on `np.exp(r.cumsum())`), entries and hit rate.
+
+**Robustness checks, the same three Vibe-Trading (HKU) runs on its backtests:**
+
+```python
+rng = np.random.default_rng(0)
+boot = [sharpe(pd.Series(rng.choice(r.values, len(r)))) for _ in range(2000)]
+sr_lo, sr_hi = np.percentile(boot, [5, 95])            # Bootstrap: Sharpe range
+
+def mdd(x):
+    e = np.exp(np.cumsum(x))
+    return float((e / np.maximum.accumulate(e) - 1).min())
+mc_dd = np.percentile([mdd(rng.permutation(r.values)) for _ in range(2000)], 5)   # Monte Carlo: bad-luck drawdown
+
+chunks = np.array_split(np.arange(len(r)), 3)          # Walk-forward: 3 slices of unseen data
+wf_wins = sum(r.iloc[c].sum() > bh.iloc[c].sum() for c in chunks)
+```
+
+- **Bootstrap:** if `sr_lo` is below 0, the result could be luck. Say so.
+- **Monte Carlo:** `mc_dd` is the drawdown to expect in a bad-luck ordering of the same days.
+- **Walk-forward:** say how many of the 3 slices beat buy and hold.
 - Say plainly whether the rule beat buy and hold on unseen data. A losing result is a valid answer.
 
-## 6. Paper trade on Alpaca (optional, only on an explicit yes)
+**Tomorrow's signal** (used in step 8):
+
+```python
+nxt = pd.concat([rets, pd.DataFrame(index=[rets.index[-1] + pd.offsets.BDay()])]).fillna(0.0)
+signal_tomorrow = bool(run(nxt, best["edge"], best["k"], int(best["hold"]))[1].iloc[-1])
+```
+
+Say whether the rule and the Kronos 5-day view agree.
+
+## 7. What big funds did (optional, Vibe-Trading MCP)
+
+Vibe-Trading (HKUDS, MIT) has a free, read-only SEC 13F tool, `get_institutional_holdings`: a fund's 13F book with quarter-over-quarter changes.
+
+- If its tools are loaded in this session, read the tool's schema. Check 3-5 well-known 13F filers, e.g. Bridgewater, Renaissance Technologies, Citadel Advisors, Berkshire Hathaway. Report whether each added, cut or holds the target. Note that 13F data is quarterly and filed up to 45 days late.
+- If its tools aren't loaded, offer the setup in one line and skip the step:
+  ```bash
+  pip install vibe-trading-ai
+  claude mcp add vibe-trading -- vibe-trading-mcp
+  ```
+  The user then restarts Claude Code. Use only its read-only research tools, never its `trading_*` tools.
+
+## 8. Paper trade on Alpaca (optional, only on an explicit yes)
 
 Ask: "Run this rule on your free Alpaca paper account?" Only continue on a clear yes.
 
@@ -147,24 +286,26 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 tc = TradingClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"], paper=True)
-# signal_today = True/False from the step-5 rule on the latest data
-if signal_today:
+if signal_tomorrow:                              # from step 6
     tc.submit_order(MarketOrderRequest(symbol="NVDA", qty=1,
         side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
 ```
 
 Show the order id and status. Offer to re-run the check daily. The user can also connect Alpaca's official MCP server instead of using this code.
 
-## 7. Final report
+## 9. Final report
 
 Keep it short, in plain language:
-1. **What moves the stock:** the peers used (iShares ETF and as-of date), then the drivers with their lags, each marked stable or fragile.
-2. **Risk:** volatility, max drawdown, beta, z-score and RSI, one line each.
-3. **Backtest:** the rule, the unseen-data result against buy and hold, and the trade count.
-4. **Paper trade:** the order details, if one was placed.
-5. **Caveats:**
+1. **Peers:** the iShares ETF and its as-of date.
+2. **What moves the stock:** the drivers with their lags, each marked stable or fragile.
+3. **Risk:** volatility, max drawdown, beta, z-score and RSI, one line each.
+4. **Kronos:** the 5-day forecast and its 20-day hit rate against a coin flip.
+5. **Backtest:** the HOLA-tuned rule (driver, `k`, `hold`), the unseen-data result against buy and hold, the bootstrap Sharpe range, the Monte Carlo drawdown and the walk-forward score.
+6. **Big funds:** the 13F changes, if step 7 ran.
+7. **Paper trade:** the order details, if one was placed.
+8. **Caveats:**
    - Causal links in markets drift over time.
-   - A backtest is not a forecast.
+   - A backtest is not a forecast, and neither is Kronos.
    - Data is free Yahoo data.
    - This is research, not financial advice.
 
