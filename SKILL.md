@@ -1,11 +1,12 @@
 ---
 name: argusdesk
-description: Find what really moves a stock (Bloomberg causal-ts), measure its risk (Goldman gs-quant), backtest the rule and paper-trade it on Alpaca. Use for "what drives X" or testing a trade idea.
+description: Pick peers from BlackRock iShares holdings, find what moves a stock (Bloomberg causal-ts), measure risk (Goldman gs-quant), backtest and paper-trade on Alpaca. Use for "what drives X" or trade ideas.
 ---
 
 # ArgusDesk: cause, risk, backtest, paper trade
 
-One workflow built on three official libraries:
+One workflow built on official open-source libraries and free data:
+- **BlackRock iShares** ETF holdings (a free CSV on ishares.com) pick the stock's real peers by fund weight.
 - **Bloomberg causal-ts** (`pip install causalts`) finds who moves whom, and at what lag.
 - **Goldman Sachs gs-quant** (`pip install gs-quant`) measures risk with its `gs_quant.timeseries` math. These functions run locally and need no Goldman login.
 - **Alpaca** (`pip install alpaca-py`) runs the rule on a free paper-trading account. This step is optional.
@@ -15,7 +16,7 @@ Work through the steps in order. Show the user a one-line status before each ste
 ## 0. Setup
 
 ```bash
-pip install causalts gs-quant yfinance pandas numpy
+pip install causalts gs-quant yfinance pandas numpy requests
 ```
 
 Check that `causal-ts --help` works. Install `alpaca-py` only if the user wants step 6.
@@ -24,12 +25,30 @@ Check that `causal-ts --help` works. Install `alpaca-py` only if the user wants 
 
 - **Target:** the ticker the user named. If they named none, ask for one.
 - **Candidate drivers:** 5-8 series, unless the user gave their own:
-  - The sector ETF, e.g. SOXX for chips or XLF for banks.
-  - 2-3 key suppliers, customers or rivals, e.g. TSM and AMD for NVDA.
+  - The target's iShares sector ETF, e.g. SOXX for chips.
+  - 2-3 peers from that ETF's holdings (BlackRock iShares, see below). Add a key supplier or customer that isn't in the ETF, e.g. TSM for NVDA.
   - The market: SPY or QQQ.
   - Rates: TLT.
   - The dollar: UUP.
 - Window: 2 years of daily data unless the user asks otherwise.
+
+**Peers from BlackRock iShares holdings (free, no login).** iShares ETF pages on ishares.com have a "Download latest fund holdings CSV data" link ending in `latest-holdings.csv`. Find the page for the target's sector ETF and use that link. Example for SOXX:
+
+```python
+import io, requests, pandas as pd
+url = "https://www.ishares.com/us/products/239705/ishares-semiconductor-etf/latest-holdings.csv"
+lines = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text.splitlines()
+asof = next((l.split(",", 1)[1].strip('"') for l in lines if l.startswith("Fund Holdings as of")), "?")
+start = next(i for i, l in enumerate(lines) if l.startswith("Ticker,"))
+h = pd.read_csv(io.StringIO("\n".join(lines[start:])), on_bad_lines="skip")
+h = h[h["Asset Class"] == "Equity"].dropna(subset=["Ticker"])
+h["Weight (%)"] = pd.to_numeric(h["Weight (%)"], errors="coerce")
+top = h.sort_values("Weight (%)", ascending=False)[["Ticker", "Name", "Weight (%)"]].head(10)
+```
+
+- Pick the 2-3 biggest holdings other than the target as peers. Also say the target's own weight in the fund.
+- Tell the user: "peers from iShares <ETF> holdings as of <asof>".
+- If the download fails or the target has no iShares sector ETF, pick peers yourself and say so.
 
 Tell the user the list in one line and continue. Don't wait for approval unless they asked to choose.
 
@@ -139,7 +158,7 @@ Show the order id and status. Offer to re-run the check daily. The user can also
 ## 7. Final report
 
 Keep it short, in plain language:
-1. **What moves the stock:** the drivers with their lags, each marked stable or fragile.
+1. **What moves the stock:** the peers used (iShares ETF and as-of date), then the drivers with their lags, each marked stable or fragile.
 2. **Risk:** volatility, max drawdown, beta, z-score and RSI, one line each.
 3. **Backtest:** the rule, the unseen-data result against buy and hold, and the trade count.
 4. **Paper trade:** the order details, if one was placed.
