@@ -16,6 +16,13 @@ One workflow built on official open-source libraries and free data:
 
 Work through the steps in order. Show the user a one-line status before each step. Never present results as financial advice.
 
+**Auto-run mode.** When the prompt contains "auto-run" (a daily scheduled run), nobody is watching:
+- Ask no questions. Use the ticker from the prompt and the default drivers from step 1.
+- Skip steps 7 and 8. Never place an order in auto-run.
+- Install missing packages yourself, and keep going if an optional step fails.
+- Start the report with one line: date, ticker, tomorrow's signal, Kronos 5-day direction.
+- Save it as `argusdesk_report.md` and as `argusdesk_<TICKER>_<YYYY-MM-DD>.md` in the current folder.
+
 ## 0. Setup
 
 ```bash
@@ -291,7 +298,7 @@ if signal_tomorrow:                              # from step 6
         side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
 ```
 
-Show the order id and status. Offer to re-run the check daily. The user can also connect Alpaca's official MCP server instead of using this code.
+Show the order id and status. Offer to re-run the check daily (see "Run it every day" in the README). The user can also connect Alpaca's official MCP server instead of using this code.
 
 ## 9. Final report
 

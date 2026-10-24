@@ -48,6 +48,22 @@ You get:
 
 For the paper-trading step, create a free paper account at alpaca.markets. Then set `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in your environment.
 
+## Run it every day
+
+ArgusDesk is a skill, so it runs when you call it. To get a fresh report every weekday after the US close, pick one:
+
+**Claude desktop app (no Terminal).** In the Code tab, click **Scheduled**, then **New task**, then **Set up manually**. Use the prompt `/argusdesk NVDA auto-run`, pick a local folder for the reports, set the schedule to weekdays at 23:30 your time (or any time after 16:00 New York), and turn on **Only on this computer**. Press **Run now** once and allow the tools it asks for. It runs while the app is open and the Mac is awake.
+
+**macOS Terminal (runs even with the app closed).**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Bodila51/ArgusDesk/main/daily.sh | bash -s NVDA
+```
+
+It installs the Claude Code CLI if needed and adds a launchd job for Mon-Fri at 23:30 Mac time (`--time 22:15` to change it, more tickers after NVDA). Reports go to `~/ArgusDesk-reports`, and you get a notification. To remove it, run the same command with `--remove` in place of `NVDA`.
+
+In auto-run the skill asks no questions and never places orders.
+
 ## Built on
 
 - [bloomberg/causal-ts](https://github.com/bloomberg/causal-ts): GPL-3.0, installed from PyPI as `causalts`.
